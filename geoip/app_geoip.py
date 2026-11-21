@@ -145,11 +145,11 @@ def maybe_collapse_networks(nets, aggregate: bool):
     return sorted(ipaddress.collapse_addresses(nets_list), key=lambda n: int(n.network_address))
 
 
-def parse_custom_cidrs(raw: Optional[str]) -> List[ipaddress.IPv4Network]:
-    """Parse custom list (CIDR, one per line)."""
+def parse_custom_cidrs(raw: Optional[str]) -> List[Any]:
+    """Parse custom list (CIDR, one per line, IPv4 and IPv6)."""
     if raw is None or not raw.strip():
         return []
-    nets: List[ipaddress.IPv4Network] = []
+    nets: List[Any] = []
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -158,9 +158,15 @@ def parse_custom_cidrs(raw: Optional[str]) -> List[ipaddress.IPv4Network]:
             net = ipaddress.ip_network(line, strict=False)
         except ValueError:
             continue
-        if isinstance(net, ipaddress.IPv4Network):
-            nets.append(net)
+        nets.append(net)
     return nets
+
+
+def split_nets_by_family(nets: List[Any]):
+    """Split a mixed network list into (ipv4_nets, ipv6_nets)."""
+    v4 = [n for n in nets if isinstance(n, ipaddress.IPv4Network)]
+    v6 = [n for n in nets if isinstance(n, ipaddress.IPv6Network)]
+    return v4, v6
 
 
 def list_old_name(list_name: str) -> str:
@@ -312,6 +318,7 @@ def load_country_catalog() -> None:
 # ---------------------------------------------------------------------------
 
 _country_nets: Dict[str, List[ipaddress.IPv4Network]] = {}
+_country_nets_v6: Dict[str, List[ipaddress.IPv6Network]] = {}
 _last_refresh_ts: Optional[float] = None
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -408,22 +415,16 @@ def download_and_extract_geoip() -> None:
     print("[GEOIP] Extraction done.")
 
 
-def load_country_nets_from_disk() -> None:
-    """Load country codes only (XX.zone files, XX = 2 letters).
+def _load_zone_dir(zone_dir: Path, net_cls) -> Dict[str, List[Any]]:
+    nets: Dict[str, List[Any]] = {}
 
-    Files like eu.zone or ap.zone are ignored to avoid treating them as
-    countries. Logical zones are handled via zones.yaml (ZONE_DEFS).
-    """
-    global _country_nets, _last_refresh_ts
-    nets: Dict[str, List[ipaddress.IPv4Network]] = {}
-
-    for zone_file in GEOIP_IPV4_DIR.glob("*.zone"):
+    for zone_file in zone_dir.glob("*.zone"):
         code = zone_file.stem.lower()  # "ch", "fr", "eu", ...
         # Filter: ISO country codes only (2 letters)
         if len(code) != 2 or not code.isalpha():
             continue
 
-        cidrs: List[ipaddress.IPv4Network] = []
+        cidrs: List[Any] = []
         for line in zone_file.read_text().splitlines():
             line = line.strip()
             if not line:
@@ -432,14 +433,29 @@ def load_country_nets_from_disk() -> None:
                 net = ipaddress.ip_network(line, strict=False)
             except ValueError:
                 continue
-            if isinstance(net, ipaddress.IPv4Network):
+            if isinstance(net, net_cls):
                 cidrs.append(net)
         if cidrs:
             nets[code] = cidrs
 
-    _country_nets = nets
+    return nets
+
+
+def load_country_nets_from_disk() -> None:
+    """Load country codes only (XX.zone files, XX = 2 letters).
+
+    Files like eu.zone or ap.zone are ignored to avoid treating them as
+    countries. Logical zones are handled via zones.yaml (ZONE_DEFS).
+    """
+    global _country_nets, _country_nets_v6, _last_refresh_ts
+
+    _country_nets = _load_zone_dir(GEOIP_IPV4_DIR, ipaddress.IPv4Network)
+    _country_nets_v6 = _load_zone_dir(GEOIP_IPV6_DIR, ipaddress.IPv6Network)
     _last_refresh_ts = time.time()
-    print(f"[GEOIP] Loaded {len(_country_nets)} country files into memory.")
+    print(
+        f"[GEOIP] Loaded {len(_country_nets)} IPv4 and "
+        f"{len(_country_nets_v6)} IPv6 country files into memory."
+    )
 
 
 def refresh_geoip_full() -> None:
@@ -560,13 +576,21 @@ INDEX_HTML = """<!DOCTYPE html>
           <input id="aggregate" type="checkbox" checked />
           Aggregate subnets (collapse overlapping/contiguous prefixes)
         </label>
+        <label style="margin-top:6px;">
+          <input id="family-ipv4" type="checkbox" checked />
+          IPv4 (<code>/ip firewall address-list</code>)
+        </label>
+        <label style="margin-top:6px;">
+          <input id="family-ipv6" type="checkbox" />
+          IPv6 (<code>/ipv6 firewall address-list</code>)
+        </label>
         <p class="note">
           Countries are identified by their ISO code (e.g. CH, FR, DE).
           Zones are loaded from <code>zones.yaml</code>.
         </p>
         <label>
           Custom list (one per line):
-          <textarea id="custom-cidr" placeholder="10.0.0.0/8&#10;192.168.0.0/16"></textarea>
+          <textarea id="custom-cidr" placeholder="10.0.0.0/8&#10;192.168.0.0/16&#10;2001:db8::/32"></textarea>
         </label>
     </div>
 
@@ -833,7 +857,13 @@ add chain=prerouting action=drop src-address-list=geoip-old
 
 # geoip.rsc example (prefix)
 add chain=prerouting action=accept src-address-list=geoip-at
-add chain=prerouting action=accept src-address-list=geoip-at-old</code></pre>
+add chain=prerouting action=accept src-address-list=geoip-at-old
+
+# IPv6 equivalent (when IPv6 is enabled in the generated URL)
+/ipv6 firewall raw
+add chain=prerouting action=accept src-address-list=geoip
+add chain=prerouting action=accept src-address-list=geoip-old
+add chain=prerouting action=drop</code></pre>
   </section>
 </main>
 <footer>
@@ -885,7 +915,7 @@ add chain=prerouting action=accept src-address-list=geoip-at-old</code></pre>
     });
   }
 
-  function buildParams(baseParams, ccs, zones, aggregateFlag) {
+  function buildParams(baseParams, ccs, zones, aggregateFlag, families) {
     const params = [];
 
     if (baseParams) {
@@ -900,10 +930,24 @@ add chain=prerouting action=accept src-address-list=geoip-at-old</code></pre>
       params.push("aggregate=1");
     }
 
+    if (families) {
+      if (!families.v4) params.push("ipv4=0");
+      if (families.v6) params.push("ipv6=1");
+    }
+
     ccs.forEach(cc => params.push("cc=" + encodeURIComponent(cc)));
     zones.forEach(z => params.push("zone=" + encodeURIComponent(z)));
 
     return params.join("&");
+  }
+
+  function collectFamilies() {
+    const v4El = document.getElementById("family-ipv4");
+    const v6El = document.getElementById("family-ipv6");
+    return {
+      v4: !v4El || v4El.checked,
+      v6: !!(v6El && v6El.checked),
+    };
   }
 
   function escapeMikrotikLine(line) {
@@ -976,11 +1020,17 @@ add chain=prerouting action=accept src-address-list=geoip-at-old</code></pre>
       return null;
     }
 
+    const families = collectFamilies();
+    if (!families.v4 && !families.v6) {
+      alert("Please enable at least one address family (IPv4 or IPv6).");
+      return null;
+    }
+
     const baseParams = {};
     if (listName) baseParams["list"] = listName;
     if (customRaw) baseParams["custom"] = customRaw;
 
-    const qs = buildParams(baseParams, ccs, zones, aggregateFlag);
+    const qs = buildParams(baseParams, ccs, zones, aggregateFlag, families);
     const url = (origin || "") + "/custom.rsc" + (qs ? "?" + qs : "");
 
     if (out) out.value = url;
@@ -1010,11 +1060,17 @@ add chain=prerouting action=accept src-address-list=geoip-at-old</code></pre>
       return null;
     }
 
+    const families = collectFamilies();
+    if (!families.v4 && !families.v6) {
+      alert("Please enable at least one address family (IPv4 or IPv6).");
+      return null;
+    }
+
     const baseParams = {};
     if (prefix) baseParams["prefix"] = prefix;
     if (customRaw) baseParams["custom"] = customRaw;
 
-    const qs = buildParams(baseParams, ccs, zones, aggregateFlag);
+    const qs = buildParams(baseParams, ccs, zones, aggregateFlag, families);
     const url = (origin || "") + "/geoip.rsc" + (qs ? "?" + qs : "");
 
     if (out) out.value = url;
@@ -1130,7 +1186,7 @@ def render_index_html() -> str:
     if _country_catalog:
         country_codes = sorted(_country_catalog.keys())
     else:
-        country_codes = sorted(_country_nets.keys())
+        country_codes = sorted(set(_country_nets.keys()) | set(_country_nets_v6.keys()))
 
     for code in country_codes:
         label = code.upper()
@@ -1185,7 +1241,10 @@ def favicon():
 def health():
     ts = _last_refresh_ts or 0
     age = int(time.time() - ts) if ts else -1
-    return f"ok (last_refresh_age={age}s, countries={len(_country_nets)}, zones={len(ZONE_DEFS)})\n"
+    return (
+        f"ok (last_refresh_age={age}s, countries={len(_country_nets)}, "
+        f"countries_v6={len(_country_nets_v6)}, zones={len(ZONE_DEFS)})\n"
+    )
 
 
 @app.get("/custom.rsc", response_class=PlainTextResponse)
@@ -1195,24 +1254,31 @@ def custom_rsc(
     list_name_param: Optional[str] = Query(None, alias="list"),
     aggregate_param: int = Query(0, alias="aggregate"),
     custom_param: Optional[str] = Query(None, alias="custom"),
+    ipv4_param: int = Query(1, alias="ipv4"),
+    ipv6_param: int = Query(0, alias="ipv6"),
 ):
     """Combine all selected countries/zones into a single address-list.
 
     - Default list name: geoip
     - Comment: country code or zone name for each entry
     - Option aggregate=1 to aggregate subnets per source
+    - Options ipv4=0/1 and ipv6=0/1 select address families (default IPv4 only)
     """
     try:
         list_name = normalize_list_name(list_name_param)
         aggregate = bool(aggregate_param)
-        custom_nets = parse_custom_cidrs(custom_param)
+        want_v4 = bool(ipv4_param)
+        want_v6 = bool(ipv6_param)
+        if not want_v4 and not want_v6:
+            raise ValueError("At least one of ipv4/ipv6 must be enabled")
+        custom_v4, custom_v6 = split_nets_by_family(parse_custom_cidrs(custom_param))
 
         selected_countries: List[str] = []
         selected_zones: List[str] = []
 
         for c_raw in cc:
             c = c_raw.strip().lower()
-            if c and c in _country_nets and c not in selected_countries:
+            if c and (c in _country_nets or c in _country_nets_v6) and c not in selected_countries:
                 selected_countries.append(c)
 
         for z_raw in zone:
@@ -1220,65 +1286,81 @@ def custom_rsc(
             if zkey and zkey in ZONE_DEFS and zkey not in selected_zones:
                 selected_zones.append(zkey)
 
-        if not selected_countries and not selected_zones and not custom_nets:
+        if not selected_countries and not selected_zones and not (custom_v4 or custom_v6):
             raise ValueError("No valid countries or zones selected")
 
+        def build_family_section(
+            section_header: str,
+            country_nets: Dict[str, List[Any]],
+            custom_nets: List[Any],
+        ) -> List[str]:
+            lines: List[str] = []
+            lines.append(section_header)
+            old_list = list_old_name(list_name)
+            lines.append(
+                f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
+            )
+            seen: Set[str] = set()
+            any_entries = False
+
+            for c in sorted(selected_countries):
+                nets = country_nets.get(c, [])
+                if not nets:
+                    continue
+                nets_final = maybe_collapse_networks(nets, aggregate)
+                for net in nets_final:
+                    key = net.with_prefixlen
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(
+                        f'add list={list_name} address={key} dynamic=yes comment="{c.upper()}"'
+                    )
+                    any_entries = True
+
+            for z in sorted(selected_zones):
+                nets_zone: Set[Any] = set()
+                for c in ZONE_DEFS[z]:
+                    if c in country_nets:
+                        nets_zone.update(country_nets[c])
+                if not nets_zone:
+                    continue
+                nets_final = maybe_collapse_networks(nets_zone, aggregate)
+                for net in nets_final:
+                    key = net.with_prefixlen
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(
+                        f'add list={list_name} address={key} dynamic=yes comment="{z}"'
+                    )
+                    any_entries = True
+
+            if custom_nets:
+                nets_final = maybe_collapse_networks(custom_nets, aggregate)
+                for net in nets_final:
+                    key = net.with_prefixlen
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(
+                        f'add list={list_name} address={key} dynamic=yes comment="Custom"'
+                    )
+                    any_entries = True
+
+            return lines if any_entries else []
+
         lines: List[str] = []
-        lines.append("/ip firewall address-list")
+        if want_v4:
+            lines.extend(
+                build_family_section("/ip firewall address-list", _country_nets, custom_v4)
+            )
+        if want_v6:
+            lines.extend(
+                build_family_section("/ipv6 firewall address-list", _country_nets_v6, custom_v6)
+            )
 
-        any_entries = False
-        old_list = list_old_name(list_name)
-        lines.append(
-            f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
-        )
-        seen: Set[str] = set()
-
-        for c in sorted(selected_countries):
-            nets = _country_nets.get(c, [])
-            if not nets:
-                continue
-            nets_final = maybe_collapse_networks(nets, aggregate)
-            for net in nets_final:
-                key = net.with_prefixlen
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(
-                    f'add list={list_name} address={key} dynamic=yes comment="{c.upper()}"'
-                )
-                any_entries = True
-
-        for z in sorted(selected_zones):
-            nets_zone: Set[ipaddress.IPv4Network] = set()
-            for c in ZONE_DEFS[z]:
-                if c in _country_nets:
-                    nets_zone.update(_country_nets[c])
-            if not nets_zone:
-                continue
-            nets_final = maybe_collapse_networks(nets_zone, aggregate)
-            for net in nets_final:
-                key = net.with_prefixlen
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(
-                    f'add list={list_name} address={key} dynamic=yes comment="{z}"'
-                )
-                any_entries = True
-
-        if custom_nets:
-            nets_final = maybe_collapse_networks(custom_nets, aggregate)
-            for net in nets_final:
-                key = net.with_prefixlen
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(
-                    f'add list={list_name} address={key} dynamic=yes comment="Custom"'
-                )
-                any_entries = True
-
-        if not any_entries:
+        if not lines:
             raise ValueError("No networks resolved for selected countries/zones")
 
         script = "\n".join(lines) + "\n"
@@ -1297,6 +1379,8 @@ def geoip_rsc(
     prefix_param: Optional[str] = Query(None, alias="prefix"),
     aggregate_param: int = Query(0, alias="aggregate"),
     custom_param: Optional[str] = Query(None, alias="custom"),
+    ipv4_param: int = Query(1, alias="ipv4"),
+    ipv6_param: int = Query(0, alias="ipv6"),
 ):
     """Generate separate lists for each country and each zone.
 
@@ -1304,18 +1388,23 @@ def geoip_rsc(
     - List name per zone: <prefix>-<ZONE> (geoip-EU, geoip-US, ...)
     - No comment is added to entries.
     - Option aggregate=1 to aggregate subnets per list.
+    - Options ipv4=0/1 and ipv6=0/1 select address families (default IPv4 only)
     """
     try:
         prefix = normalize_prefix(prefix_param, GEOIP_COUNTRY_PREFIX)
         aggregate = bool(aggregate_param)
-        custom_nets = parse_custom_cidrs(custom_param)
+        want_v4 = bool(ipv4_param)
+        want_v6 = bool(ipv6_param)
+        if not want_v4 and not want_v6:
+            raise ValueError("At least one of ipv4/ipv6 must be enabled")
+        custom_v4, custom_v6 = split_nets_by_family(parse_custom_cidrs(custom_param))
 
         selected_countries: Set[str] = set()
         selected_zones: Set[str] = set()
 
         for c_raw in cc:
             c = c_raw.strip().lower()
-            if c and c in _country_nets:
+            if c and (c in _country_nets or c in _country_nets_v6):
                 selected_countries.add(c)
 
         for z_raw in zone:
@@ -1325,86 +1414,101 @@ def geoip_rsc(
             if zkey in ZONE_DEFS:
                 selected_zones.add(zkey)
                 for c in ZONE_DEFS[zkey]:
-                    if c in _country_nets:
+                    if c in _country_nets or c in _country_nets_v6:
                         selected_countries.add(c)
 
-        if not selected_countries and not selected_zones and not custom_nets:
+        if not selected_countries and not selected_zones and not (custom_v4 or custom_v6):
             raise ValueError("No valid countries or zones selected")
 
-        list_names: Set[str] = set()
+        def build_family_section(
+            section_header: str,
+            country_nets: Dict[str, List[Any]],
+            custom_nets: List[Any],
+        ) -> List[str]:
+            lines: List[str] = []
+            lines.append(section_header)
+            any_entries = False
 
-        for c in selected_countries:
-            list_names.add(f"{prefix}-{c.lower()}")
+            # Entries per country
+            for c in sorted(selected_countries):
+                nets = country_nets.get(c, [])
+                if not nets:
+                    continue
+                list_name = f"{prefix}-{c.lower()}"
+                old_list = list_old_name(list_name)
+                lines.append(
+                    f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
+                )
+                seen: Set[str] = set()
+                nets_final = maybe_collapse_networks(nets, aggregate)
+                for net in nets_final:
+                    key = net.with_prefixlen
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(
+                        f"add list={list_name} address={key} dynamic=yes"
+                    )
+                    any_entries = True
 
-        for z in selected_zones:
-            list_names.add(f"{prefix}-{z}")
+            # Entries per zone (union of zone countries)
+            for z in sorted(selected_zones):
+                list_name = f"{prefix}-{z}"
+                nets_zone: Set[Any] = set()
+                for c in ZONE_DEFS[z]:
+                    if c in selected_countries:
+                        for net in country_nets.get(c, []):
+                            nets_zone.add(net)
+                if not nets_zone:
+                    continue
+                nets_final = maybe_collapse_networks(nets_zone, aggregate)
+                old_list = list_old_name(list_name)
+                lines.append(
+                    f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
+                )
+                seen = set()
+                for net in nets_final:
+                    key = net.with_prefixlen
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(
+                        f"add list={list_name} address={key} dynamic=yes"
+                    )
+                    any_entries = True
 
-        if custom_nets:
-            list_names.add(f"{prefix}-custom")
+            if custom_nets:
+                list_name = f"{prefix}-custom"
+                nets_final = maybe_collapse_networks(custom_nets, aggregate)
+                old_list = list_old_name(list_name)
+                lines.append(
+                    f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
+                )
+                seen = set()
+                for net in nets_final:
+                    key = net.with_prefixlen
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(
+                        f"add list={list_name} address={key} dynamic=yes"
+                    )
+                    any_entries = True
+
+            return lines if any_entries else []
 
         lines: List[str] = []
-        lines.append("/ip firewall address-list")
-
-        # Entries per country
-        for c in sorted(selected_countries):
-            nets = _country_nets.get(c, [])
-            if not nets:
-                continue
-            list_name = f"{prefix}-{c.lower()}"
-            old_list = list_old_name(list_name)
-            lines.append(
-                f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
+        if want_v4:
+            lines.extend(
+                build_family_section("/ip firewall address-list", _country_nets, custom_v4)
             )
-            seen: Set[str] = set()
-            nets_final = maybe_collapse_networks(nets, aggregate)
-            for net in nets_final:
-                key = net.with_prefixlen
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(
-                    f"add list={list_name} address={key} dynamic=yes"
-                )
-
-        # Entries per zone (union of zone countries)
-        for z in sorted(selected_zones):
-            list_name = f"{prefix}-{z}"
-            nets_zone: Set[ipaddress.IPv4Network] = set()
-            for c in ZONE_DEFS[z]:
-                if c in selected_countries:
-                    for net in _country_nets.get(c, []):
-                        nets_zone.add(net)
-            nets_final = maybe_collapse_networks(nets_zone, aggregate)
-            old_list = list_old_name(list_name)
-            lines.append(
-                f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
+        if want_v6:
+            lines.extend(
+                build_family_section("/ipv6 firewall address-list", _country_nets_v6, custom_v6)
             )
-            seen: Set[str] = set()
-            for net in nets_final:
-                key = net.with_prefixlen
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(
-                    f"add list={list_name} address={key} dynamic=yes"
-                )
 
-        if custom_nets:
-            list_name = f"{prefix}-custom"
-            nets_final = maybe_collapse_networks(custom_nets, aggregate)
-            old_list = list_old_name(list_name)
-            lines.append(
-                f':do {{ set [find list={list_name}] list={old_list} timeout=00:05:00 }} on-error={{}}'
-            )
-            seen: Set[str] = set()
-            for net in nets_final:
-                key = net.with_prefixlen
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(
-                    f"add list={list_name} address={key} dynamic=yes"
-                )
+        if not lines:
+            raise ValueError("No networks resolved for selected countries/zones")
 
         script = "\n".join(lines) + "\n"
         return PlainTextResponse(content=script, media_type="text/plain; charset=utf-8")

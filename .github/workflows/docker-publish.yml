@@ -35,5 +35,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            reptechwifx/mikrotik-geoip:latest
-            reptechwifx/mikrotik-geoip:${{ github.ref_name }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/mikrotik-geoip:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/mikrotik-geoip:${{ github.ref_name }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/mikrotik-geoip:${{ steps.version.outputs.TAG }}
